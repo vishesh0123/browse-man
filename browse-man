@@ -1,0 +1,913 @@
+#!/usr/bin/env python3
+"""
+browse-man — index and explore every man page on your machine in a web browser.
+
+Zero dependencies: uses only the Python standard library and the system's
+`mandoc` (shipped with macOS 13+) to render pages to HTML. Falls back to
+`man` + `col` plain-text rendering if mandoc is not available.
+
+Usage:
+    browse-man                 # index all pages, start server, open browser
+    browse-man ls              # open straight to ls(1)
+    browse-man --port 9000 --no-open
+    browse-man --rebuild       # ignore the cached index
+"""
+
+import argparse
+import gzip
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, quote, urlparse
+
+__version__ = "0.1.0"
+
+CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/Library/Caches"),
+    "browse-man",
+)
+CACHE_FILE = os.path.join(CACHE_DIR, "index-v1.json")
+
+SECTION_NAMES = {
+    "1": "General commands",
+    "2": "System calls",
+    "3": "Library functions",
+    "4": "Devices & drivers",
+    "5": "File formats",
+    "6": "Games",
+    "7": "Miscellaneous",
+    "8": "System administration",
+    "9": "Kernel internals",
+    "n": "Tcl / Tk",
+}
+
+PAGE_RE = re.compile(r"^(?P<name>.+)\.(?P<sec>[0-9n][A-Za-z0-9_+-]*)$")
+
+
+def log(*a):
+    print("[browse-man]", *a, file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------
+# Discovery
+# --------------------------------------------------------------------------
+
+def system_manpath():
+    """Default search path as man(1) would compute it, ignoring $MANPATH."""
+    env = {k: v for k, v in os.environ.items() if k != "MANPATH"}
+    for cmd in (["manpath"], ["man", "-w"]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True,
+                                 timeout=10, env=env).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if out:
+            return out
+    return "/usr/share/man:/usr/local/share/man:/opt/homebrew/share/man"
+
+
+def get_manpath(override=None):
+    raw = override or os.environ.get("MANPATH") or ""
+    if not raw:
+        raw = system_manpath()
+    elif raw.startswith(":") or raw.endswith(":") or "::" in raw:
+        # An empty entry in MANPATH means "insert the system default here".
+        default = system_manpath()
+        raw = ":".join(default if not d else d for d in raw.split(":"))
+    seen, out = set(), []
+    for d in raw.split(":"):
+        d = d.strip()
+        if not d or not os.path.isdir(d):
+            continue
+        real = os.path.realpath(d)
+        if real in seen:
+            continue
+        seen.add(real)
+        out.append(d)
+    return out
+
+
+def scan_manpath(dirs):
+    """Yield (name, section, path, root) for every page, in manpath order."""
+    for root in dirs:
+        try:
+            subdirs = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for sub in subdirs:
+            if not sub.startswith("man") or len(sub) < 4:
+                continue
+            secdir = os.path.join(root, sub)
+            if not os.path.isdir(secdir):
+                continue
+            try:
+                files = os.listdir(secdir)
+            except OSError:
+                continue
+            for fn in files:
+                base = fn[:-3] if fn.endswith(".gz") else fn
+                m = PAGE_RE.match(base)
+                if not m:
+                    continue
+                path = os.path.join(secdir, fn)
+                if not os.path.isfile(path):  # also drops broken symlinks
+                    continue
+                yield m.group("name"), m.group("sec"), path, root
+
+
+# --------------------------------------------------------------------------
+# Reading / parsing roff sources
+# --------------------------------------------------------------------------
+
+def read_source(path, limit=None):
+    try:
+        if path.endswith(".gz"):
+            with gzip.open(path, "rb") as f:
+                data = f.read(limit) if limit else f.read()
+        else:
+            with open(path, "rb") as f:
+                data = f.read(limit) if limit else f.read()
+    except (OSError, EOFError):
+        return ""
+    return data.decode("utf-8", errors="replace")
+
+
+ROFF_SUBS = [
+    (re.compile(r"\\f(\[[^\]]*\]|\(..|.)"), ""),
+    (re.compile(r"\\s[+-]?\d+"), ""),
+    (re.compile(r"\\\*(\[[^\]]*\]|\(..|.)"), ""),
+    (re.compile(r"\\\((em|en)"), "\u2014"),
+    (re.compile(r"\\\((lq|rq|dq)"), '"'),
+    (re.compile(r"\\\((oq|cq|aq)"), "'"),
+    (re.compile(r"\\\(.."), ""),
+    (re.compile(r"\\\[[^\]]*\]"), ""),
+    (re.compile(r"\\[-]"), "-"),
+    (re.compile(r"\\e"), "\\\\"),
+    (re.compile(r"\\[&|^%:c]"), ""),
+    (re.compile(r"\\[ ~0]"), " "),
+    (re.compile(r"\\(.)"), r"\1"),
+]
+
+
+def strip_roff(s):
+    for rx, rep in ROFF_SUBS:
+        s = rx.sub(rep, s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def resolve_so(src, root):
+    """Return path of `.so` target if the page is just a redirect."""
+    for line in src.splitlines():
+        line = line.strip()
+        if not line or line.startswith('.\\"') or line.startswith("'\\\""):
+            continue
+        if line.startswith(".so "):
+            target = line[4:].strip()
+            for cand in (target, target + ".gz"):
+                p = os.path.join(root, cand)
+                if os.path.isfile(p):
+                    return p
+        return None
+    return None
+
+
+def extract_desc(path, root, depth=0):
+    src = read_source(path, 24576)
+    if not src:
+        return ""
+    if depth < 3:
+        so = resolve_so(src, root)
+        if so:
+            return extract_desc(so, root, depth + 1)
+    # mdoc(7)
+    m = re.search(r"^\.Nd\s+(.*)$", src, re.M)
+    if m:
+        return strip_roff(m.group(1).strip('"'))[:200]
+    # man(7): text following .SH NAME
+    m = re.search(r'^\.S[Hh]\s+"?(NAME|Name|名前|NOM|NOMBRE)"?\s*$', src, re.M)
+    if not m:
+        return ""
+    parts = []
+    for line in src[m.end():].splitlines():
+        s = line.strip()
+        if not s or s.startswith('.\\"'):
+            continue
+        if re.match(r"^\.(S[HhSs]|TH)\b", s):
+            break
+        if s.startswith("."):
+            mm = re.match(r"^\.[A-Za-z]+\s*(.*)$", s)
+            s = mm.group(1) if mm else ""
+            if not s:
+                continue
+        parts.append(s)
+        if len(" ".join(parts)) > 400:
+            break
+    text = strip_roff(" ".join(parts).replace('"', ""))
+    for sep in (" - ", " -- ", " \u2014 ", " \u2013 "):
+        if sep in text:
+            return text.split(sep, 1)[1].strip()[:200]
+    return text[:200]
+
+
+# --------------------------------------------------------------------------
+# Index
+# --------------------------------------------------------------------------
+
+class Index:
+    def __init__(self, dirs, rebuild=False):
+        self.dirs = dirs
+        self.pages = []   # list of dicts
+        self.by_name = {}  # name -> [ids]
+        self._build(rebuild)
+
+    def _build(self, rebuild):
+        t0 = time.time()
+        cache = {}
+        if not rebuild:
+            try:
+                with open(CACHE_FILE) as f:
+                    cache = json.load(f).get("files", {})
+            except (OSError, ValueError):
+                cache = {}
+
+        entries, seen = [], set()
+        for name, sec, path, root in scan_manpath(self.dirs):
+            key = (name, sec)
+            if key in seen:
+                continue  # earlier manpath entry wins, like man(1)
+            seen.add(key)
+            entries.append((name, sec, path, root))
+
+        def describe(e):
+            name, sec, path, root = e
+            real = os.path.realpath(path)
+            try:
+                st = os.stat(real)
+                stamp = "%d:%d" % (st.st_mtime, st.st_size)
+            except OSError:
+                stamp = ""
+            c = cache.get(path)
+            if c and c[0] == stamp:
+                return stamp, c[1]
+            return stamp, extract_desc(path, root)
+
+        with ThreadPoolExecutor(max_workers=min(16, (os.cpu_count() or 4) * 2)) as ex:
+            results = list(ex.map(describe, entries, chunksize=64))
+
+        new_cache = {}
+        for (name, sec, path, root), (stamp, desc) in zip(entries, results):
+            real = os.path.realpath(path)
+            alias = None
+            if real != path and os.path.islink(path):
+                tb = os.path.basename(real)
+                tb = tb[:-3] if tb.endswith(".gz") else tb
+                mm = PAGE_RE.match(tb)
+                if mm and mm.group("name") != name:
+                    alias = mm.group("name")
+            pid = len(self.pages)
+            self.pages.append({
+                "id": pid, "name": name, "sec": sec, "desc": desc,
+                "path": path, "real": real, "root": root, "alias": alias,
+            })
+            self.by_name.setdefault(name, []).append(pid)
+            self.by_name.setdefault(name.lower(), [])
+            if name.lower() != name:
+                self.by_name[name.lower()].append(pid)
+            new_cache[path] = [stamp, desc]
+
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            tmp = CACHE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"version": 1, "files": new_cache}, f)
+            os.replace(tmp, CACHE_FILE)
+        except OSError as e:
+            log("could not write cache:", e)
+
+        log("indexed %d pages from %d directories in %.1fs"
+            % (len(self.pages), len(self.dirs), time.time() - t0))
+
+    def resolve(self, name, sec=None):
+        ids = self.by_name.get(name) or self.by_name.get(name.lower()) or []
+        if not ids:
+            return None
+        if sec:
+            for i in ids:
+                if self.pages[i]["sec"] == sec:
+                    return i
+            for i in ids:
+                if self.pages[i]["sec"].startswith(sec[0]):
+                    return i
+        return ids[0]
+
+    def client_json(self):
+        secs = {}
+        for p in self.pages:
+            secs[p["sec"]] = secs.get(p["sec"], 0) + 1
+        return json.dumps({
+            "version": __version__,
+            "manpath": self.dirs,
+            "sections": secs,
+            "sectionNames": SECTION_NAMES,
+            "pages": [
+                [p["name"], p["sec"], p["desc"], p["path"], p["alias"]]
+                for p in self.pages
+            ],
+        }, separators=(",", ":"))
+
+
+# --------------------------------------------------------------------------
+# Rendering
+# --------------------------------------------------------------------------
+
+MANDOC = shutil.which("mandoc") or ("/usr/bin/mandoc" if os.path.exists("/usr/bin/mandoc") else None)
+
+XREF_RE = re.compile(
+    r"(?<![\w\"=#/.-])(<(b|i|code|var)[^>]*>)?([A-Za-z_][\w.:+\-]*)(</\2>)?"
+    r"\(([0-9n][A-Za-z0-9]*)\)"
+)
+ANCHOR_SPLIT = re.compile(r"(<a\b[^>]*>.*?</a>)", re.S)
+
+
+def link_xrefs(fragment, index):
+    """Turn plain `name(sec)` references (common in man(7) pages) into links."""
+    def repl(m):
+        name, sec = m.group(3), m.group(5)
+        pid = index.resolve(name, sec)
+        if pid is None:
+            return m.group(0)
+        p = index.pages[pid]
+        href = "#/%s/%s" % (quote(p["sec"]), quote(p["name"]))
+        return '<a class="Xr" href="%s">%s</a>' % (href, m.group(0))
+
+    # Leave mandoc's header/footer lines (e.g. "LS(1)") alone.
+    # Different mandoc versions use <main>/<div> and <div>/<table> for these.
+    a = fragment.find('class="manual-text"')
+    a = fragment.rfind("<", 0, a) if a >= 0 else 0
+    b = fragment.rfind('class="foot"')
+    b = fragment.rfind("<", 0, b) if b >= 0 else len(fragment)
+    head, body, tail = fragment[:a], fragment[a:b], fragment[b:]
+    parts = ANCHOR_SPLIT.split(body)
+    for i in range(0, len(parts), 2):
+        parts[i] = XREF_RE.sub(repl, parts[i])
+    return head + "".join(parts) + tail
+
+
+def render_page(index, pid):
+    return _render_cached(index, pid)
+
+
+@lru_cache(maxsize=256)
+def _render_cached(index, pid):
+    p = index.pages[pid]
+    out = None
+    if MANDOC:
+        try:
+            r = subprocess.run(
+                [MANDOC, "-T", "html", "-W", "stop", "-O", "fragment,man=#/%S/%N", p["path"]],
+                cwd=p["root"], capture_output=True, timeout=20,
+            )
+            if r.stdout.strip():
+                out = r.stdout.decode("utf-8", errors="replace")
+        except (OSError, subprocess.SubprocessError):
+            out = None
+    if out is None:
+        out = render_plain(p)
+    return link_xrefs(out, index)
+
+
+def render_plain(p):
+    env = dict(os.environ, MANPAGER="cat", PAGER="cat", MANWIDTH="100", LANG="en_US.UTF-8")
+    try:
+        r = subprocess.run(["man", p["path"]], capture_output=True, env=env, timeout=20)
+        txt = r.stdout.decode("utf-8", errors="replace")
+        txt = re.sub(r".\x08", "", txt)  # strip overstrike bold/underline
+    except (OSError, subprocess.SubprocessError):
+        txt = ""
+    if not txt.strip():
+        txt = read_source(p["path"])
+    return '<pre class="plain">%s</pre>' % html.escape(txt)
+
+
+# --------------------------------------------------------------------------
+# Full-text search
+# --------------------------------------------------------------------------
+
+def full_text_search(index, query, limit=200, sec=None):
+    q = query.lower()
+    if len(q) < 2:
+        return []
+    uniq = {}
+    for p in index.pages:
+        if sec and not p["sec"].startswith(sec):
+            continue
+        uniq.setdefault(p["real"], p["id"])
+    targets = list(uniq.values())
+    hits, lock, stop = [], threading.Lock(), threading.Event()
+
+    def scan(pid):
+        if stop.is_set():
+            return
+        p = index.pages[pid]
+        src = read_source(p["path"])
+        low = src.lower()
+        pos = low.find(q)
+        if pos < 0:
+            return
+        count = low.count(q)
+        snippet, first = "", None
+        while pos >= 0:  # prefer a match outside roff comments
+            ls = src.rfind("\n", 0, pos) + 1
+            le = src.find("\n", pos)
+            line = src[ls:le if le >= 0 else None]
+            if first is None:
+                first = line
+            if not line.lstrip().startswith(('.\\"', "'\\\"", '\\"')):
+                snippet = line
+                break
+            pos = low.find(q, le if le >= 0 else len(low))
+        snippet = strip_roff(re.sub(r"^\.[A-Za-z]+\s*", "", snippet or first or ""))
+        name_bonus = 1000 if q in p["name"].lower() else 0
+        with lock:
+            hits.append((name_bonus + count, pid, snippet[:220]))
+            if len(hits) >= limit * 4:
+                stop.set()
+
+    with ThreadPoolExecutor(max_workers=min(16, (os.cpu_count() or 4) * 2)) as ex:
+        list(ex.map(scan, targets, chunksize=32))
+    hits.sort(key=lambda h: -h[0])
+    return [{"id": pid, "score": s, "snippet": snip} for s, pid, snip in hits[:limit]]
+
+
+# --------------------------------------------------------------------------
+# HTTP server
+# --------------------------------------------------------------------------
+
+class Handler(BaseHTTPRequestHandler):
+    index = None
+    index_json = b""
+    server_version = "browse-man/" + __version__
+
+    def log_message(self, fmt, *args):  # quiet
+        pass
+
+    def _send(self, code, body, ctype="text/html; charset=utf-8", cache=False):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "max-age=3600" if cache else "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        # Only answer requests addressed to localhost (DNS-rebinding guard).
+        host = (self.headers.get("Host") or "").split(":")[0]
+        if host not in ("127.0.0.1", "localhost"):
+            return self._send(403, "forbidden", "text/plain")
+        u = urlparse(self.path)
+        qs = parse_qs(u.query)
+        try:
+            if u.path == "/":
+                return self._send(200, APP_HTML)
+            if u.path == "/api/index":
+                return self._send(200, self.index_json, "application/json")
+            if u.path == "/api/page":
+                pid = int(qs.get("id", ["-1"])[0])
+                if not 0 <= pid < len(self.index.pages):
+                    return self._send(404, "not found", "text/plain")
+                body = render_page(self.index, pid)
+                return self._send(200, body, "text/html; charset=utf-8", cache=True)
+            if u.path == "/api/source":
+                pid = int(qs.get("id", ["-1"])[0])
+                if not 0 <= pid < len(self.index.pages):
+                    return self._send(404, "not found", "text/plain")
+                return self._send(200, read_source(self.index.pages[pid]["path"]),
+                                  "text/plain; charset=utf-8")
+            if u.path == "/api/grep":
+                q = qs.get("q", [""])[0]
+                sec = qs.get("sec", [""])[0] or None
+                t0 = time.time()
+                res = full_text_search(self.index, q, sec=sec)
+                return self._send(200, json.dumps(
+                    {"query": q, "ms": int((time.time() - t0) * 1000), "hits": res}),
+                    "application/json")
+            if u.path == "/favicon.ico":
+                return self._send(204, b"", "image/x-icon")
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except ValueError:
+            return self._send(400, "bad request", "text/plain")
+        self._send(404, "not found", "text/plain")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="browse-man",
+        description="Index and explore all man pages on this machine in your browser.")
+    ap.add_argument("page", nargs="?", help="open directly to this page, e.g. ls or printf.3")
+    ap.add_argument("-p", "--port", type=int, default=8642, help="port (default 8642, 0 = random)")
+    ap.add_argument("--no-open", action="store_true", help="don't open a browser window")
+    ap.add_argument("--rebuild", action="store_true", help="ignore the cached index")
+    ap.add_argument("--manpath", help="colon-separated directories (default: output of `manpath`)")
+    ap.add_argument("--version", action="version", version="%(prog)s " + __version__)
+    args = ap.parse_args()
+
+    dirs = get_manpath(args.manpath)
+    if not dirs:
+        sys.exit("browse-man: no man directories found")
+    if not MANDOC:
+        log("mandoc not found; falling back to plain-text rendering")
+
+    log("indexing %d man directories…" % len(dirs))
+    idx = Index(dirs, rebuild=args.rebuild)
+    Handler.index = idx
+    Handler.index_json = idx.client_json().encode("utf-8")
+
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    except OSError:
+        log("port %d busy, picking a random one" % args.port)
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv.daemon_threads = True
+    url = "http://127.0.0.1:%d/" % srv.server_address[1]
+
+    if args.page:
+        m = re.match(r"^(.+?)(?:\.([0-9n]\w*)|\(([0-9n]\w*)\))?$", args.page)
+        name, sec = m.group(1), m.group(2) or m.group(3)
+        pid = idx.resolve(name, sec)
+        if pid is None:
+            log("no page named %r; opening index" % args.page)
+        else:
+            p = idx.pages[pid]
+            url += "#/%s/%s" % (quote(p["sec"]), quote(p["name"]))
+
+    log("serving at", url, "(Ctrl-C to quit)")
+    if not args.no_open:
+        threading.Timer(0.3, lambda: webbrowser.open(url)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print()
+    finally:
+        srv.server_close()
+
+
+# --------------------------------------------------------------------------
+# Front-end (single page, no external assets)
+# --------------------------------------------------------------------------
+
+APP_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>browse-man</title>
+<style>
+:root{
+  color-scheme:light dark;
+  --bg:#fbfaf8; --panel:#f3f1ed; --line:#e2ded6; --fg:#1d1c1a; --muted:#6c6860;
+  --accent:#b4441f; --accent-bg:#f6e3da; --code:#24527a; --var:#7a3e8c; --sel:#ebe7df;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#17171a; --panel:#1e1e22; --line:#2e2e34; --fg:#e7e5e0; --muted:#9a968e;
+    --accent:#f08a5d; --accent-bg:#3a2720; --code:#8cc4f0; --var:#d6a4e8; --sel:#2a2a30;
+  }
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:15px/1.55 var(--sans)}
+a{color:var(--accent)}
+#app{display:grid;grid-template-columns:340px 1fr;height:100vh}
+aside{border-right:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0}
+.brand{padding:14px 16px 6px;display:flex;align-items:baseline;gap:8px}
+.brand a{font:600 17px var(--mono);color:var(--fg);text-decoration:none}
+.brand small{color:var(--muted);font-size:12px}
+.search{padding:6px 12px 8px}
+.search input{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:14px var(--sans);outline:none}
+.search input:focus{border-color:var(--accent)}
+.modes{display:flex;gap:6px;padding:0 12px 8px;font-size:12px}
+.modes button,.chips button{border:1px solid var(--line);background:var(--bg);color:var(--muted);border-radius:999px;padding:3px 10px;font:12px var(--sans);cursor:pointer}
+.modes button.on,.chips button.on{background:var(--accent-bg);color:var(--accent);border-color:transparent}
+.chips{display:flex;flex-wrap:wrap;gap:5px;padding:0 12px 10px}
+.count{padding:0 16px 6px;color:var(--muted);font-size:12px}
+#list{overflow-y:auto;overflow-x:hidden;flex:1;margin:0;padding:0 6px 20px;list-style:none}
+#list li{padding:6px 10px;border-radius:7px;cursor:pointer;min-width:0}
+#list li:hover{background:var(--sel)}
+#list li.active{background:var(--accent-bg)}
+#list .n{font:500 13.5px var(--mono)}
+#list .s{color:var(--muted);font:12px var(--mono)}
+#list .d{color:var(--muted);font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#list .snip{color:var(--muted);font:11.5px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#list mark{background:none;color:var(--accent);font-weight:600}
+#list .more{text-align:center;color:var(--accent);font-size:13px}
+main{overflow:auto;min-width:0}
+.wrap{max-width:900px;margin:0 auto;padding:28px 36px 80px}
+.toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:14px;color:var(--muted);font-size:12.5px}
+.toolbar code{font:12px var(--mono);background:var(--panel);border:1px solid var(--line);padding:2px 6px;border-radius:5px}
+.toolbar button{border:1px solid var(--line);background:var(--panel);color:var(--fg);border-radius:6px;padding:3px 9px;font:12px var(--sans);cursor:pointer}
+.toc{display:flex;flex-wrap:wrap;gap:4px 12px;padding:10px 0 14px;border-bottom:1px solid var(--line);margin-bottom:10px;font-size:12.5px}
+.toc a{color:var(--muted);text-decoration:none;font:12px var(--mono)}
+.toc a:hover{color:var(--accent)}
+/* mandoc output */
+.head,.foot{display:flex;justify-content:space-between;color:var(--muted);font:12px var(--mono);gap:10px}
+.foot{margin-top:40px;border-top:1px solid var(--line);padding-top:10px}
+.head-vol{text-align:center}
+.manual-text h1,.manual-text h2{font:600 14px var(--sans);letter-spacing:.06em;text-transform:uppercase;margin:28px 0 8px;color:var(--fg)}
+.manual-text h3{font:600 14px var(--sans);margin:20px 0 6px}
+.manual-text .permalink{color:inherit;text-decoration:none}
+.manual-text p{margin:.6em 0}
+.manual-text section>p,.manual-text section>dl,.manual-text section>div,.manual-text section>table,.manual-text section>pre,.manual-text section>ul,.manual-text section>ol{margin-left:2.2em}
+code,.Li,.Pa,.Fl,.Cm,.Nm,.Fn,.Fd,.In,.Ev,.Er,.Dv,.Ic,.Va,.Ad,.Ms,.Sx{font-family:var(--mono);font-size:.92em}
+.Nm,.Fl,.Cm,.Fn,.Ic{color:var(--code);font-weight:600}
+var,.Ar,.Fa,.Ft,.Va{color:var(--var);font-style:italic;font-family:var(--mono);font-size:.92em}
+.Xr{text-decoration:none;border-bottom:1px dotted var(--accent)}
+.Xr:hover{border-bottom-style:solid}
+dl.Bl-tag>dt,dl.Bl-hang>dt{margin-top:.7em;font-weight:500}
+dl.Bl-tag>dd,dl.Bl-hang>dd{margin-left:2.2em}
+.Bd-indent{margin-left:2.2em}
+pre,.Bd.Li,.Bd-literal{font:13px/1.45 var(--mono);background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:10px 12px;overflow:auto}
+pre.plain{background:none;border:0;padding:0;white-space:pre-wrap}
+table.Nm td{vertical-align:top;padding-right:.6em}
+table.tbl{border-collapse:collapse}table.tbl td{padding:2px 10px 2px 0}
+b{font-weight:600}
+/* home */
+.home h1{font:600 30px var(--mono);margin:6px 0 4px}
+.home .lead{color:var(--muted);margin:0 0 24px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
+.card{border:1px solid var(--line);border-radius:10px;padding:12px 14px;cursor:pointer;background:var(--panel)}
+.card:hover{border-color:var(--accent)}
+.card b{font:600 18px var(--mono)}
+.card div{color:var(--muted);font-size:13px}
+.kbd{font:11px var(--mono);border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;padding:0 5px}
+.manpath{color:var(--muted);font:12px var(--mono);margin-top:28px;line-height:1.8}
+.loading{color:var(--muted);padding:40px 0}
+.menu-btn{display:none}
+@media (max-width:760px){
+  #app{grid-template-columns:1fr}
+  aside{position:fixed;inset:0 20% 0 0;z-index:5;transform:translateX(-100%);transition:transform .2s}
+  body.nav aside{transform:none;box-shadow:0 0 40px rgba(0,0,0,.3)}
+  .wrap{padding:16px 16px 60px}
+  .menu-btn{display:inline-block}
+  .manual-text section>*{margin-left:0!important}
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <aside>
+    <div class="brand"><a href="#/">browse-man</a><small id="total"></small></div>
+    <div class="search"><input id="q" placeholder="Search names & descriptions…  ( / )" autocomplete="off" spellcheck="false"></div>
+    <div class="modes">
+      <button data-mode="name" class="on">Names</button>
+      <button data-mode="full" title="Search the full text of every page (press Enter)">Full text</button>
+    </div>
+    <div class="chips" id="chips"></div>
+    <div class="count" id="count"></div>
+    <ul id="list"></ul>
+  </aside>
+  <main id="main"><div class="wrap" id="view"><div class="loading">Loading index…</div></div></main>
+</div>
+<script>
+(() => {
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let DB, PAGES = [], byKey = new Map(), byName = new Map();
+let mode = 'name', sec = '', results = [], shown = 0, cursor = -1, current = -1, grepTimer = null, grepCtl = null;
+const PAGE_SIZE = 300;
+
+function secGroup(s){ return /^[0-9]/.test(s) ? s[0] : s[0] === 'n' ? 'n' : s; }
+
+async function boot(){
+  DB = await (await fetch('/api/index')).json();
+  PAGES = DB.pages.map((p, id) => ({id, name:p[0], sec:p[1], desc:p[2]||'', path:p[3], alias:p[4], lname:p[0].toLowerCase(), ldesc:(p[2]||'').toLowerCase()}));
+  for (const p of PAGES){
+    byKey.set(p.sec + '/' + p.name, p.id);
+    const k = p.lname; if (!byName.has(k)) byName.set(k, []); byName.get(k).push(p.id);
+  }
+  $('#total').textContent = PAGES.length.toLocaleString() + ' pages';
+  const groups = {};
+  for (const [s, n] of Object.entries(DB.sections)) { const g = secGroup(s); groups[g] = (groups[g]||0) + n; }
+  DB.groups = groups;
+  const order = Object.keys(groups).sort((a,b) => (a==='n') - (b==='n') || a.localeCompare(b, undefined, {numeric:true}));
+  $('#chips').innerHTML = '<button data-sec="" class="on">All</button>' + order.map(g => `<button data-sec="${esc(g)}" title="${esc(DB.sectionNames[g]||'')}">${esc(g)}</button>`).join('');
+  DB.order = order;
+  search();
+  route();
+}
+
+function resolve(name, s){
+  if (s && byKey.has(s + '/' + name)) return byKey.get(s + '/' + name);
+  const ids = byName.get(name.toLowerCase()) || [];
+  if (!ids.length) return -1;
+  if (s) { const m = ids.find(i => PAGES[i].sec[0] === s[0]); if (m !== undefined) return m; }
+  return ids[0];
+}
+
+/* ---------- name search ---------- */
+function search(){
+  const q = $('#q').value.trim().toLowerCase();
+  if (mode === 'full') { scheduleGrep(); return; }
+  let list = sec ? PAGES.filter(p => secGroup(p.sec) === sec) : PAGES;
+  if (q) {
+    const terms = q.split(/\s+/);
+    const scored = [];
+    for (const p of list){
+      let score = 0, ok = true;
+      for (const t of terms){
+        let s = 0;
+        if (p.lname === t) s = 100;
+        else if (p.lname.startsWith(t)) s = 60 - Math.min(p.lname.length - t.length, 30) / 2;
+        else if (p.lname.includes(t)) s = 30;
+        else if (p.ldesc.includes(t)) s = p.ldesc.match(new RegExp('\\b' + t.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'))) ? 12 : 6;
+        if (!s) { ok = false; break; }
+        score += s;
+      }
+      if (ok) scored.push([score + (p.sec[0] === '1' ? 2 : p.sec[0] === '8' ? 1 : 0), p]);
+    }
+    scored.sort((a,b) => b[0]-a[0] || a[1].name.length - b[1].name.length || a[1].name.localeCompare(b[1].name));
+    results = scored.map(x => ({p:x[1]}));
+  } else {
+    results = list.map(p => ({p})).sort((a,b) => a.p.lname.localeCompare(b.p.lname) || a.p.sec.localeCompare(b.p.sec));
+  }
+  $('#count').textContent = results.length.toLocaleString() + (q ? ' matches' : ' pages');
+  shown = 0; cursor = -1; $('#list').innerHTML = ''; renderMore();
+}
+
+function hl(text, q){
+  if (!q) return esc(text);
+  const terms = q.split(/\s+/).filter(Boolean).map(t => t.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'));
+  if (!terms.length) return esc(text);
+  const re = new RegExp('(' + terms.join('|') + ')', 'ig');
+  return esc(text).replace(re, '<mark>$1</mark>');
+}
+
+function renderMore(){
+  const q = $('#q').value.trim();
+  const ul = $('#list'); const old = ul.querySelector('.more'); if (old) old.remove();
+  const frag = document.createDocumentFragment();
+  const end = Math.min(results.length, shown + PAGE_SIZE);
+  for (let i = shown; i < end; i++){
+    const {p, snippet} = results[i];
+    const li = document.createElement('li');
+    li.dataset.id = p.id; li.dataset.i = i;
+    if (p.id === current) li.classList.add('active');
+    li.innerHTML = `<span class="n">${hl(p.name, mode==='name'?q:'')}</span><span class="s">(${esc(p.sec)})</span>` +
+      `<div class="d">${p.alias ? '→ ' + esc(p.alias) + ' · ' : ''}${hl(p.desc || '', mode==='name'?q:'')}</div>` +
+      (snippet ? `<div class="snip">${hl(snippet, q)}</div>` : '');
+    frag.appendChild(li);
+  }
+  shown = end;
+  if (shown < results.length){
+    const li = document.createElement('li'); li.className = 'more';
+    li.textContent = `Show more (${(results.length - shown).toLocaleString()} left)`;
+    frag.appendChild(li);
+  }
+  ul.appendChild(frag);
+}
+
+/* ---------- full-text search ---------- */
+function scheduleGrep(immediate){
+  clearTimeout(grepTimer);
+  const q = $('#q').value.trim();
+  if (q.length < 2){ results = []; $('#list').innerHTML=''; $('#count').textContent = 'Type at least 2 characters, then Enter'; return; }
+  $('#count').textContent = 'Press Enter to search full text…';
+  if (immediate) grep(q);
+}
+async function grep(q){
+  if (grepCtl) grepCtl.abort();
+  grepCtl = new AbortController();
+  $('#count').textContent = 'Searching every page for “' + q + '”…';
+  try{
+    const r = await (await fetch('/api/grep?q=' + encodeURIComponent(q) + (sec ? '&sec=' + encodeURIComponent(sec) : ''), {signal: grepCtl.signal})).json();
+    results = r.hits.map(h => ({p: PAGES[h.id], snippet: h.snippet}));
+    $('#count').textContent = `${results.length}${results.length >= 200 ? '+' : ''} pages contain “${q}” · ${r.ms} ms`;
+    shown = 0; cursor = -1; $('#list').innerHTML = ''; renderMore();
+  } catch(e){ if (e.name !== 'AbortError') $('#count').textContent = 'Search failed'; }
+}
+
+/* ---------- views ---------- */
+function home(){
+  current = -1; markActive();
+  document.title = 'browse-man';
+  const g = DB.groups;
+  $('#view').innerHTML = `<div class="home">
+    <div class="toolbar"><button class="menu-btn" data-act="menu">☰ Pages</button></div>
+    <h1>man pages</h1>
+    <p class="lead">${PAGES.length.toLocaleString()} manual pages indexed on this machine. Press <span class="kbd">/</span> to search, <span class="kbd">↑</span><span class="kbd">↓</span> to move, <span class="kbd">Enter</span> to open.</p>
+    <div class="grid">${DB.order.map(s => `<div class="card" data-sec="${esc(s)}"><b>${esc(s)}</b> <span style="color:var(--muted)">${(g[s]||0).toLocaleString()}</span><div>${esc(DB.sectionNames[s] || 'Section ' + s)}</div></div>`).join('')}
+      <div class="card" data-act="random"><b>⚄</b><div>Random page</div></div></div>
+    <div class="manpath">MANPATH<br>${DB.manpath.map(esc).join('<br>')}</div></div>`;
+}
+
+async function show(id, anchor){
+  const p = PAGES[id]; current = id; markActive();
+  document.title = `${p.name}(${p.sec}) — browse-man`;
+  document.body.classList.remove('nav');
+  $('#view').innerHTML = '<div class="loading">Rendering…</div>';
+  const html = await (await fetch('/api/page?id=' + id)).text();
+  if (current !== id) return;
+  const others = (byName.get(p.lname) || []).filter(i => i !== id);
+  $('#view').innerHTML = `<div class="toolbar">
+      <button class="menu-btn" data-act="menu">☰ Pages</button>
+      <code>man ${/^[0-9]/.test(p.sec) ? esc(p.sec[0]) + ' ' : ''}${esc(p.name)}</code>
+      <button data-act="copy">Copy</button>
+      <a href="/api/source?id=${id}" target="_blank">source</a>
+      <span title="${esc(p.path)}">${esc(p.path)}</span>
+      ${others.length ? '· also in ' + others.map(i => `<a href="#/${encodeURIComponent(PAGES[i].sec)}/${encodeURIComponent(PAGES[i].name)}">${esc(PAGES[i].sec)}</a>`).join(', ') : ''}
+    </div><div class="toc" id="toc"></div><div id="doc">${html}</div>`;
+  const heads = [...$('#doc').querySelectorAll('h1.Sh, h2.Sh')];
+  $('#toc').innerHTML = heads.map(h => `<a data-anchor="${esc(h.id)}" href="#">${esc(h.textContent)}</a>`).join('');
+  if (!heads.length) $('#toc').remove();
+  $('#main').scrollTop = 0;
+  if (anchor) { const el = document.getElementById(anchor); if (el) el.scrollIntoView(); }
+}
+
+function markActive(){
+  for (const li of document.querySelectorAll('#list li.active')) li.classList.remove('active');
+  const li = document.querySelector(`#list li[data-id="${current}"]`); if (li) li.classList.add('active');
+}
+
+function route(){
+  const h = decodeURIComponent(location.hash.slice(1));
+  const m = h.match(/^\/([^/]+)\/(.+)$/);
+  if (!m) return home();
+  const id = resolve(m[2], m[1]);
+  if (id < 0) { $('#view').innerHTML = `<p class="loading">No page named <b>${esc(m[2])}(${esc(m[1])})</b> on this machine.</p>`; return; }
+  const p = PAGES[id];
+  if (p.sec !== m[1] || p.name !== m[2]) { history.replaceState(null, '', `#/${encodeURIComponent(p.sec)}/${encodeURIComponent(p.name)}`); }
+  show(id);
+}
+function go(id){ const p = PAGES[id]; location.hash = `/${encodeURIComponent(p.sec)}/${encodeURIComponent(p.name)}`; }
+
+/* ---------- events ---------- */
+window.addEventListener('hashchange', route);
+$('#q').addEventListener('input', () => { if (mode === 'name') search(); else scheduleGrep(); });
+$('#q').addEventListener('keydown', e => {
+  const lis = [...document.querySelectorAll('#list li[data-id]')];
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp'){
+    e.preventDefault();
+    cursor = Math.max(0, Math.min(lis.length - 1, cursor + (e.key === 'ArrowDown' ? 1 : -1)));
+    lis.forEach((li, i) => li.classList.toggle('active', i === cursor));
+    if (lis[cursor]) lis[cursor].scrollIntoView({block:'nearest'});
+  } else if (e.key === 'Enter'){
+    if (mode === 'full' && cursor < 0) return scheduleGrep(true);
+    const li = lis[cursor >= 0 ? cursor : 0]; if (li) go(+li.dataset.id);
+  } else if (e.key === 'Escape'){ $('#q').value = ''; search(); $('#q').blur(); }
+});
+document.addEventListener('keydown', e => {
+  if (e.key === '/' && document.activeElement !== $('#q')) { e.preventDefault(); $('#q').focus(); $('#q').select(); }
+});
+$('#list').addEventListener('click', e => {
+  const li = e.target.closest('li'); if (!li) return;
+  if (li.classList.contains('more')) return renderMore();
+  go(+li.dataset.id);
+});
+document.querySelector('.modes').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  mode = b.dataset.mode;
+  document.querySelectorAll('.modes button').forEach(x => x.classList.toggle('on', x === b));
+  $('#q').placeholder = mode === 'name' ? 'Search names & descriptions…  ( / )' : 'Search inside every page, then Enter';
+  $('#q').focus(); search();
+});
+function setSec(s){
+  sec = s;
+  document.querySelectorAll('#chips button').forEach(x => x.classList.toggle('on', x.dataset.sec === s));
+  if (mode === 'full' && $('#q').value.trim().length >= 2) scheduleGrep(true); else search();
+}
+$('#chips').addEventListener('click', e => { const b = e.target.closest('button'); if (b) setSec(b.dataset.sec); });
+$('#view').addEventListener('click', e => {
+  const card = e.target.closest('.card');
+  if (card){ if (card.dataset.act === 'random') return go(Math.floor(Math.random() * PAGES.length)); setSec(card.dataset.sec); document.body.classList.add('nav'); return; }
+  const act = e.target.closest('[data-act]');
+  if (act && act.dataset.act === 'copy'){ navigator.clipboard.writeText(act.previousElementSibling.textContent); act.textContent = 'Copied'; setTimeout(() => act.textContent = 'Copy', 1200); return; }
+  if (act && act.dataset.act === 'menu'){ document.body.classList.toggle('nav'); return; }
+  const a = e.target.closest('a'); if (!a) return;
+  const anchor = a.dataset.anchor || ((a.getAttribute('href')||'').match(/^#(?!\/)(.+)/)||[])[1];
+  if (anchor){ e.preventDefault(); const el = document.getElementById(decodeURIComponent(anchor)); if (el) el.scrollIntoView({behavior:'smooth'}); }
+});
+$('#main').addEventListener('click', e => { if (document.body.classList.contains('nav') && !e.target.closest('[data-act="menu"]') && !e.target.closest('.card')) document.body.classList.remove('nav'); });
+
+boot();
+})();
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    main()
