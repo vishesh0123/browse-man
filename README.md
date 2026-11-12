@@ -33,14 +33,14 @@ Many man page tools and scripts work fine on Linux but have problems on macOS. T
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/<you>/browse-man/main/browse-man -o /usr/local/bin/browse-man
+curl -fsSL https://raw.githubusercontent.com/vishesh0123/browse-man/main/browse-man -o /usr/local/bin/browse-man
 chmod +x /usr/local/bin/browse-man
 ```
 
 Or clone the repo and run it in place:
 
 ```sh
-git clone https://github.com/<you>/browse-man.git
+git clone https://github.com/vishesh0123/browse-man.git
 cd browse-man
 ./browse-man            # or: python3 browse-man
 ```
